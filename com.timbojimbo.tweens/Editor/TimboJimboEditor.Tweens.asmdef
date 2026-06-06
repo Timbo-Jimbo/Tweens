@@ -2,7 +2,12 @@
     "name": "TimboJimboEditor.Tweens",
     "rootNamespace": "TimboJimboEditor.Tweens",
     "references": [
-        "TimboJimbo.Tweens.Runtime"
+        "TimboJimbo.Core.Runtime",
+        "TimboJimbo.Tweens.Runtime",
+        "TimboJimbo.Styling.Runtime",
+        "TimboJimbo.PropertyBindings.Runtime",
+        "TimboJimboEditor.PropertyBindings",
+        "TimboJimboEditor.Core"
     ],
     "includePlatforms": [
         "Editor"

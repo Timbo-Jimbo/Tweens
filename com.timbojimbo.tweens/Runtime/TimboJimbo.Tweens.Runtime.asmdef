@@ -2,7 +2,8 @@
     "name": "TimboJimbo.Tweens.Runtime",
     "rootNamespace": "TimboJimbo.Tweens",
     "references": [
-        "TimboJimbo.Core.Runtime"
+        "TimboJimbo.Core.Runtime",
+        "TimboJimbo.PropertyBindings.Runtime"
     ],
     "includePlatforms": [],
     "excludePlatforms": [],
