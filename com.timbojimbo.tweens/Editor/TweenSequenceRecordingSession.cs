@@ -1,8 +1,8 @@
 using System;
 using System.Collections.Generic;
 using TimboJimbo;
+using TimboJimbo.Core;
 using TimboJimbo.PropertyBindings;
-using TimboJimbo.Styling;
 using TimboJimboEditor.PropertyBindings.Utility;
 using UnityEditor;
 using UnityEngine;

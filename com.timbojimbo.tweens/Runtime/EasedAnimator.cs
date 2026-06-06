@@ -1,6 +1,6 @@
 using System;
+using TimboJimbo.Core;
 using TimboJimbo.PropertyBindings;
-using TimboJimbo.Styling;
 
 namespace TimboJimbo
 {

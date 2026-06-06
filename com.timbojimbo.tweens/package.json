@@ -1,13 +1,13 @@
 {
 	"name": "com.timbojimbo.tweens",
 	"displayName": "Tweens",
-	"version": "0.1.0",
+	"version": "0.5.0",
 	"unity": "6000.0",
 	"unityRelease": "0f1",
 	"description": "",
 	"dependencies": {
-		"com.timbojimbo.core": "0.1.0",
-		"com.timbojimbo.propertybindings": "0.4.0",
+		"com.timbojimbo.core": "0.5.0",
+		"com.timbojimbo.propertybindings": "0.5.0",
 		"com.unity.test-framework": "1.6.0"
 	},
 	"author": {
