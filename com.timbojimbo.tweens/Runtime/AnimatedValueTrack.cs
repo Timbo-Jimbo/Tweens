@@ -15,85 +15,71 @@ namespace TimboJimbo
 
         [SerializeField]
         private List<AnimatedValueTrackEntry> _entries = new List<AnimatedValueTrackEntry>();
-
-        [NonSerialized] private readonly List<int> _sortedIndices = new List<int>();
-        [NonSerialized] private int _sortedForCount = -1;
+        [NonSerialized] private bool _timingDirty = true;
+        [NonSerialized] private float _duration;
 
         public IReadOnlyList<AnimatedValueTrackEntry> Entries => _entries;
+
+        public float Duration
+        {
+            get
+            {
+                EnsureTiming();
+                return _duration;
+            }
+        }
 
         public void AddEntry(AnimatedValueTrackEntry entry)
         {
             _entries.Add(entry);
-            InvalidateSort();
+            MarkTimingDirty();
         }
 
         public void RemoveEntryAt(int index)
         {
             if (index < 0 || index >= _entries.Count) return;
             _entries.RemoveAt(index);
-            InvalidateSort();
         }
 
-        public void InvalidateSort() => _sortedForCount = -1;
+        public void MarkTimingDirty() => _timingDirty = true;
 
         /// Evaluates this track at the given timeline time.
-        public ValueContainer Evaluate(float time, ValueContainer baseline, Dictionary<AnimatedValueTrackEntry, TrackTimeSlot> timeSlots)
+        public ValueContainer Evaluate(float time, ValueContainer baseline)
         {
             if (Property.Target == null) return baseline;
 
-            EnsureSorted(timeSlots);
+            EnsureTiming();
 
             var ctx = new AnimatorContext { Baseline = baseline, Accumulated = baseline };
 
-            for (int i = 0; i < _sortedIndices.Count; i++)
+            for (int i = 0; i < _entries.Count; i++)
             {
-                var entry = _entries[_sortedIndices[i]];
+                var entry = _entries[i];
                 if (entry == null || entry.Animator == null) continue;
-                if (!timeSlots.TryGetValue(entry, out var slot)) continue;
-                if (time < slot.StartTime) break;
+                if (time < entry.StartTime) break;
 
-                ctx.Accumulated = entry.Sample(slot, time, in ctx);
+                ctx.Accumulated = entry.Sample(time, in ctx);
             }
 
             return ctx.Accumulated;
         }
 
-        private void EnsureSorted(Dictionary<AnimatedValueTrackEntry, TrackTimeSlot> timeSlots)
-        {
-            if (_sortedForCount != _entries.Count || _sortedIndices.Count != _entries.Count)
+        private void EnsureTiming()
+        {   
+            if (!_timingDirty) return;
+            
+            _timingDirty = false;
+            _entries.Sort((a, b) => a.StartTime.CompareTo(b.StartTime));
+            if (_entries.Count == 0)
             {
-                _sortedIndices.Clear();
-                for (int i = 0; i < _entries.Count; i++)
-                    _sortedIndices.Add(i);
-                _sortedForCount = _entries.Count;
+                _duration = 0f;
             }
-
-            SortIndices(timeSlots);
-        }
-
-        private void SortIndices(Dictionary<AnimatedValueTrackEntry, TrackTimeSlot> timeSlots)
-        {
-            for (int i = 1; i < _sortedIndices.Count; i++)
+            else
             {
-                int current = _sortedIndices[i];
-                float currentStart = GetStartTime(current, timeSlots);
-                int j = i - 1;
-                while (j >= 0)
-                {
-                    int previous = _sortedIndices[j];
-                    float previousStart = GetStartTime(previous, timeSlots);
-                    if (previousStart <= currentStart) break;
-                    _sortedIndices[j + 1] = previous;
-                    j--;
-                }
-                _sortedIndices[j + 1] = current;
+                var lastEntry = _entries[_entries.Count - 1];
+                _duration = lastEntry.StartTime + lastEntry.Duration;
             }
         }
 
-        private float GetStartTime(int entryIndex, Dictionary<AnimatedValueTrackEntry, TrackTimeSlot> timeSlots)
-        {
-            var entry = _entries[entryIndex];
-            return entry != null && timeSlots.TryGetValue(entry, out var slot) ? slot.StartTime : 0f;
-        }
     }
 }

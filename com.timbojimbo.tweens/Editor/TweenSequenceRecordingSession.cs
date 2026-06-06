@@ -130,8 +130,7 @@ namespace TimboJimboEditor
             {
                 entry = new AnimatedValueTrackEntry
                 {
-                    TimeSlotMode = TimeSlotMode.Absolute,
-                    AnchorTime = PlayheadTime,
+                    StartTime = PlayheadTime,
                     Duration = 1f,
                     Animator = new EasedAnimator
                     {
@@ -168,8 +167,8 @@ namespace TimboJimboEditor
                 AddEvent($"Updated entry: {GetPropertyLabel(edit.BindableProperty)} @ {PlayheadTime:0.###}s");
             }
 
-            Target.InvalidateBindings();
-            Target.InvalidateTimeSlots();
+            Target.MarkBidingsDirty();
+            Target.MarkTimingDirty();
             EditorUtility.SetDirty(Target);
 
             NotifyChanged();
@@ -207,7 +206,7 @@ namespace TimboJimboEditor
                 if (entry == null)
                     continue;
 
-                if (Mathf.Abs(entry.AnchorTime - time) <= EntryTimeEpsilon)
+                if (Mathf.Abs(entry.StartTime - time) <= EntryTimeEpsilon)
                     return entry;
             }
 

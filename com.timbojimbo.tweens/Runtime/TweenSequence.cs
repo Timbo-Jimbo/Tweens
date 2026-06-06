@@ -24,12 +24,9 @@ namespace TimboJimbo
 
         private readonly Dictionary<BindableProperty, ValueContainer> _baselines = new Dictionary<BindableProperty, ValueContainer>(BindablePropertyEqualityComparer.Instance);
         private bool _baselinesCaptured;
-
-        private PropertyBindingCollection _bindings;
         private bool _bindingsDirty = true;
-
-        private readonly Dictionary<AnimatedValueTrackEntry, TrackTimeSlot> _timeSlots = new Dictionary<AnimatedValueTrackEntry, TrackTimeSlot>();
-        private bool _timeSlotsDirty = true;
+        private bool _timingDirty = true;
+        private PropertyBindingCollection _bindings;
         private float _duration;
 
         public IReadOnlyList<AnimatedValueTrack> Tracks => _tracks;
@@ -40,7 +37,7 @@ namespace TimboJimbo
         {
             get
             {
-                EnsureTimeSlots();
+                EnsureDuration();
                 return _duration;
             }
         }
@@ -51,7 +48,7 @@ namespace TimboJimbo
         {
             _tracks.Add(track);
             _bindingsDirty = true;
-            InvalidateTimeSlots();
+            MarkTimingDirty();
         }
 
         public void RemoveTrackAt(int index)
@@ -59,33 +56,20 @@ namespace TimboJimbo
             if (index < 0 || index >= _tracks.Count) return;
             _tracks.RemoveAt(index);
             _bindingsDirty = true;
-            InvalidateTimeSlots();
+            MarkTimingDirty();
         }
 
-        public void InvalidateBindings()
+        public void MarkBidingsDirty()
         {
             _bindingsDirty = true;
             _baselinesCaptured = false;
         }
 
-        public void InvalidateTimeSlots()
+        public void MarkTimingDirty()
         {
-            _timeSlotsDirty = true;
+            _timingDirty = true;
             for (int i = 0; i < _tracks.Count; i++)
-                _tracks[i]?.InvalidateSort();
-        }
-
-        public void InvalidateSort() => InvalidateTimeSlots();
-
-        public bool TryGetTimeSlot(AnimatedValueTrackEntry entry, out TrackTimeSlot slot)
-        {
-            EnsureTimeSlots();
-            if (entry == null)
-            {
-                slot = default;
-                return false;
-            }
-            return _timeSlots.TryGetValue(entry, out slot);
+                _tracks[i]?.MarkTimingDirty();
         }
 
         public void CaptureBaselines()
@@ -207,7 +191,7 @@ namespace TimboJimbo
             if (!_baselinesCaptured)
                 CaptureBaselines();
 
-            EnsureTimeSlots();
+            EnsureDuration();
 
             if (_bindings != null)
             {
@@ -228,7 +212,7 @@ namespace TimboJimbo
                         _baselines[property] = baseline;
                     }
 
-                    var value = track.Evaluate(time, baseline, _timeSlots);
+                    var value = track.Evaluate(time, baseline);
                     bulkWriter.TryWrite(property, value);
                 }
             }
@@ -236,11 +220,22 @@ namespace TimboJimbo
             _lastSampledTime = time;
         }
 
-        private void EnsureTimeSlots()
+        private void EnsureDuration()
         {
-            if (!_timeSlotsDirty) return;
-            _duration = TrackTimeSlotResolver.Resolve(_tracks, _timeSlots);
-            _timeSlotsDirty = false;
+            if (!_timingDirty) return;
+
+            _duration = 0f;
+            for (int i = 0; i < _tracks.Count; i++)
+            {
+                var track = _tracks[i];
+                if (track == null) continue;
+                
+                var trackDuration = track.Duration;
+                if (trackDuration > _duration)
+                    _duration = trackDuration;
+            }
+
+            _timingDirty = false;
         }
 
         private void EnsureBindings()

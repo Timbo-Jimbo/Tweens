@@ -38,19 +38,35 @@ namespace TimboJimboEditor
         private const float TrackRowHeight = 36f;
         private const float MinTimelineHeight = 200f;
         private const float SnapThresholdPx = 6f;
-        private const float AnchorMarkerSize = 7f;
+        private static readonly int TimelineControlId = "TweenSequenceEditorTimeline".GetHashCode();
 
         private enum TimelineDragKind { None, Playhead, EntryMove, EntryResizeStart, EntryResizeEnd }
         private TimelineDragKind _dragKind;
         private int _dragTrackIndex = -1;
         private int _dragEntryIndex = -1;
         private float _dragGrabOffset;
+        private float _dragOriginalStart;
+        private float _dragOriginalDuration;
+        private float _dragGhostStart;
+        private float _dragGhostEnd;
+        private Rect _dragRowRect;
 
         private int _selectedTrackIndex = -1;
         private int _selectedEntryIndex = -1;
 
         private readonly List<(float time, float yMin, float yMax)> _snapLines = new();
         private readonly HashSet<float> _snapPoints = new();
+        private readonly List<EntryHit> _entryHits = new();
+
+        private struct EntryHit
+        {
+            public int TrackIndex;
+            public int EntryIndex;
+            public Rect Bar;
+            public Rect RowRect;
+            public Rect LeftEdge;
+            public Rect RightEdge;
+        }
 
         private float _inspectorWidth = 300f;
         private bool _isResizingInspector;
@@ -131,8 +147,8 @@ namespace TimboJimboEditor
             trackProp.FindPropertyRelative("_entries").ClearArray();
 
             serializedObject.ApplyModifiedProperties();
-            ((TweenSequence)target).InvalidateBindings();
-            ((TweenSequence)target).InvalidateTimeSlots();
+            ((TweenSequence)target).MarkBidingsDirty();
+            ((TweenSequence)target).MarkTimingDirty();
 
             _selectedTrackIndex = index;
             _selectedEntryIndex = -1;
@@ -147,8 +163,8 @@ namespace TimboJimboEditor
             _tracksProp.DeleteArrayElementAtIndex(_selectedTrackIndex);
             serializedObject.ApplyModifiedProperties();
 
-            ((TweenSequence)target).InvalidateBindings();
-            ((TweenSequence)target).InvalidateTimeSlots();
+            ((TweenSequence)target).MarkBidingsDirty();
+            ((TweenSequence)target).MarkTimingDirty();
 
             _selectedTrackIndex = -1;
             _selectedEntryIndex = -1;
@@ -476,8 +492,8 @@ namespace TimboJimboEditor
             EditorGUI.DrawRect(labels, new Color(0.22f, 0.22f, 0.22f));
 
             DrawRulerTicks(ruler, content, duration);
-            HandleRulerInteraction(ruler, duration);
 
+            _entryHits.Clear();
             _snapLines.Clear();
             if (_dragTrackIndex >= 0 && _dragEntryIndex >= 0)
                 CollectSnapPoints(duration, content);
@@ -507,7 +523,7 @@ namespace TimboJimboEditor
                 for (int ei = 0; ei < entriesProp.arraySize; ei++)
                 {
                     var entryProp = entriesProp.GetArrayElementAtIndex(ei);
-                    DrawEntryBar(ti, ei, entryProp, rowRect, duration);
+                    DrawEntryBar(ti, ei, entryProp, rowRect, duration, _entryHits);
                 }
             }
 
@@ -519,149 +535,173 @@ namespace TimboJimboEditor
                 EditorGUI.DrawRect(snapLine, new Color(1f, 1f, 0.3f, 0.7f));
             }
 
-            HandleTimelineBackgroundInteraction(content, duration);
+            HandleTimelineInteraction(ruler, content, duration);
             DrawPlayhead(content, ruler, duration);
         }
 
-        private void DrawEntryBar(int trackIdx, int entryIdx, SerializedProperty entryProp, Rect rowRect, float timelineDuration)
+        private void DrawEntryBar(int trackIdx, int entryIdx, SerializedProperty entryProp, Rect rowRect, float timelineDuration, List<EntryHit> hits)
         {
-            var modeProp = entryProp.FindPropertyRelative(nameof(AnimatedValueTrackEntry.TimeSlotMode));
-            var anchorProp = entryProp.FindPropertyRelative(nameof(AnimatedValueTrackEntry.AnchorTime));
+            var startTimeProp = entryProp.FindPropertyRelative(nameof(AnimatedValueTrackEntry.StartTime));
             var durProp = entryProp.FindPropertyRelative(nameof(AnimatedValueTrackEntry.Duration));
-            var mode = (TimeSlotMode)modeProp.enumValueIndex;
+            float startTime = startTimeProp.floatValue;
+            float duration = durProp.floatValue;
+            float endTime = startTime + duration;
 
-            if (!TryGetEntrySlot(trackIdx, entryIdx, out var slot))
-            {
-                slot = new TrackTimeSlot
-                {
-                    StartTime = Mathf.Max(0f, anchorProp.floatValue),
-                    Duration = mode == TimeSlotMode.FillGap ? 0f : Mathf.Max(0f, durProp.floatValue)
-                };
-            }
-
-            float x0 = rowRect.x + (slot.StartTime / timelineDuration) * rowRect.width;
-            float x1 = rowRect.x + (slot.EndTime / timelineDuration) * rowRect.width;
+            float x0 = rowRect.x + (startTime / timelineDuration) * rowRect.width;
+            float x1 = rowRect.x + (endTime / timelineDuration) * rowRect.width;
             float visualWidth = Mathf.Max(6f, x1 - x0);
             var bar = new Rect(x0, rowRect.y + 4f, visualWidth, Mathf.Max(6f, rowRect.height - 8f));
 
             bool isDragging = _dragTrackIndex == trackIdx && _dragEntryIndex == entryIdx && _dragKind != TimelineDragKind.None;
             bool isSelected = _selectedTrackIndex == trackIdx && _selectedEntryIndex == entryIdx;
-            Color fill = GetEntryColor(mode, isSelected, isDragging);
-            EditorGUI.DrawRect(bar, fill);
+
+            // Ghost: show original/natural extent when clip is truncated during drag
+            if (isDragging && duration < _dragOriginalDuration - 0.0001f)
+            {
+                float gx0 = rowRect.x + (_dragGhostStart / timelineDuration) * rowRect.width;
+                float gx1 = rowRect.x + (_dragGhostEnd / timelineDuration) * rowRect.width;
+                var ghostBar = new Rect(gx0, bar.y, Mathf.Max(1f, gx1 - gx0), bar.height);
+                EditorGUI.DrawRect(ghostBar, new Color(0.45f, 0.65f, 1f, 0.12f));
+                DrawOutline(ghostBar, new Color(0.45f, 0.65f, 1f, 0.25f));
+            }
+
+            EditorGUI.DrawRect(bar, GetEntryColor(isSelected, isDragging));
 
             if (isSelected)
                 DrawOutline(bar, new Color(1f, 1f, 1f, 0.6f));
 
             var animName = GetAnimatorShortName(entryProp.FindPropertyRelative(nameof(AnimatedValueTrackEntry.Animator)));
             var labelRect = new Rect(bar.x + 4f, bar.y + 2f, bar.width - 8f, bar.height - 4f);
-            GUI.Label(labelRect, $"{animName} {slot.StartTime:0.##}s→{slot.EndTime:0.##}s", EditorStyles.miniLabel);
+            GUI.Label(labelRect, $"{animName} {startTime:0.##}s→{endTime:0.##}s", EditorStyles.miniLabel);
 
-            float anchorX = rowRect.x + (anchorProp.floatValue / timelineDuration) * rowRect.width;
-            anchorX = Mathf.Clamp(anchorX, rowRect.x, rowRect.xMax);
-            float anchorY = bar.yMax - AnchorMarkerSize - 2f;
-            var anchorHit = new Rect(anchorX - AnchorMarkerSize, anchorY - AnchorMarkerSize, AnchorMarkerSize * 2f, AnchorMarkerSize * 2f);
-            DrawDiamond(new Vector2(anchorX, anchorY), AnchorMarkerSize, isSelected ? Color.white : new Color(1f, 0.9f, 0.25f, 1f));
-
-            HandleEntryBarInteraction(trackIdx, entryIdx, bar, anchorHit, rowRect, timelineDuration, anchorProp, durProp, mode, slot);
-        }
-
-        private void HandleEntryBarInteraction(int trackIdx, int entryIdx, Rect bar, Rect anchorHit, Rect rowRect, float timelineDuration,
-            SerializedProperty anchorProp, SerializedProperty durProp, TimeSlotMode mode, TrackTimeSlot slot)
-        {
             const float edgeGrab = 5f;
-            bool canResizeStart = mode == TimeSlotMode.Absolute;
-            bool canResizeEnd = mode != TimeSlotMode.FillGap;
             var leftEdge = new Rect(bar.x, bar.y, edgeGrab, bar.height);
             var rightEdge = new Rect(bar.xMax - edgeGrab, bar.y, edgeGrab, bar.height);
 
             EditorGUIUtility.AddCursorRect(bar, MouseCursor.MoveArrow);
-            EditorGUIUtility.AddCursorRect(anchorHit, MouseCursor.MoveArrow);
-            if (canResizeStart) EditorGUIUtility.AddCursorRect(leftEdge, MouseCursor.ResizeHorizontal);
-            if (canResizeEnd) EditorGUIUtility.AddCursorRect(rightEdge, MouseCursor.ResizeHorizontal);
+            EditorGUIUtility.AddCursorRect(leftEdge, MouseCursor.ResizeHorizontal);
+            EditorGUIUtility.AddCursorRect(rightEdge, MouseCursor.ResizeHorizontal);
 
-            int id = GUIUtility.GetControlID(FocusType.Passive);
-            var e = Event.current;
-            bool hit = bar.Contains(e.mousePosition) || anchorHit.Contains(e.mousePosition);
-
-            switch (e.GetTypeForControl(id))
+            hits.Add(new EntryHit
             {
-                case EventType.MouseDown:
-                    if (e.button == 0 && hit)
-                    {
-                        _selectedTrackIndex = trackIdx;
-                        _selectedEntryIndex = entryIdx;
+                TrackIndex = trackIdx,
+                EntryIndex = entryIdx,
+                Bar = bar,
+                RowRect = rowRect,
+                LeftEdge = leftEdge,
+                RightEdge = rightEdge,
+            });
+        }
 
-                        GUIUtility.hotControl = id;
-                        _dragTrackIndex = trackIdx;
-                        _dragEntryIndex = entryIdx;
+        private void BeginEntryDrag(int id, int trackIdx, int entryIdx, Vector2 mousePosition, Rect rowRect, float timelineDuration,
+            SerializedProperty startTimeProp, SerializedProperty durProp, Rect leftEdge, Rect rightEdge)
+        {
+            SelectEntry(trackIdx, entryIdx);
 
-                        if (canResizeEnd && rightEdge.Contains(e.mousePosition))
-                            _dragKind = TimelineDragKind.EntryResizeEnd;
-                        else if (canResizeStart && leftEdge.Contains(e.mousePosition))
-                            _dragKind = TimelineDragKind.EntryResizeStart;
-                        else
-                            _dragKind = TimelineDragKind.EntryMove;
+            GUIUtility.hotControl = id;
+            _dragKind = rightEdge.Contains(mousePosition)
+                ? TimelineDragKind.EntryResizeEnd
+                : leftEdge.Contains(mousePosition)
+                    ? TimelineDragKind.EntryResizeStart
+                    : TimelineDragKind.EntryMove;
 
-                        _dragGrabOffset = MouseToTime(e.mousePosition.x, rowRect, timelineDuration) - anchorProp.floatValue;
-                        e.Use();
-                    }
-                    else if (e.button == 1 && hit)
+            _dragTrackIndex = trackIdx;
+            _dragEntryIndex = entryIdx;
+            _dragOriginalStart = startTimeProp.floatValue;
+            _dragOriginalDuration = durProp.floatValue;
+            _dragGhostStart = _dragOriginalStart;
+            _dragGhostEnd = _dragOriginalStart + _dragOriginalDuration;
+            _dragGrabOffset = MouseToTime(mousePosition.x, rowRect, timelineDuration) - startTimeProp.floatValue;
+        }
+
+        private void EndTimelineDrag()
+        {
+            if (GUIUtility.hotControl != 0)
+                GUIUtility.hotControl = 0;
+
+            _dragKind = TimelineDragKind.None;
+            _dragTrackIndex = -1;
+            _dragEntryIndex = -1;
+            _dragRowRect = default;
+        }
+
+        private void GetNeighborBounds(int trackIdx, int entryIdx, float queryStart, float queryEnd, out float leftBound, out float rightBound)
+        {
+            leftBound = 0f;
+            rightBound = float.MaxValue;
+
+            var entriesProp = GetEntriesProp(trackIdx);
+            if (entriesProp == null) return;
+
+            for (int i = 0; i < entriesProp.arraySize; i++)
+            {
+                if (i == entryIdx) continue;
+                var ep = entriesProp.GetArrayElementAtIndex(i);
+                float s = ep.FindPropertyRelative(nameof(AnimatedValueTrackEntry.StartTime)).floatValue;
+                float d = ep.FindPropertyRelative(nameof(AnimatedValueTrackEntry.Duration)).floatValue;
+                float end = s + d;
+
+                // Clip is predominantly to the left (ends at or before our natural start)
+                if (end <= queryStart + 0.0001f)
+                    leftBound = Mathf.Max(leftBound, end);
+                // Clip is predominantly to the right (starts at or after our natural end)
+                else if (s >= queryEnd - 0.0001f)
+                    rightBound = Mathf.Min(rightBound, s);
+                // Clip overlaps from the left side
+                else if (s < queryStart)
+                    leftBound = Mathf.Max(leftBound, end);
+                // Clip overlaps from the right side
+                else
+                    rightBound = Mathf.Min(rightBound, s);
+            }
+        }
+
+        private void DeleteZeroDurationAndEmptyTracks()
+        {
+            bool changed = false;
+
+            for (int ti = 0; ti < _tracksProp.arraySize; ti++)
+            {
+                var entriesProp = GetEntriesProp(ti);
+                if (entriesProp == null) continue;
+
+                for (int ei = entriesProp.arraySize - 1; ei >= 0; ei--)
+                {
+                    var ep = entriesProp.GetArrayElementAtIndex(ei);
+                    float dur = ep.FindPropertyRelative(nameof(AnimatedValueTrackEntry.Duration)).floatValue;
+                    if (dur <= 0f)
                     {
-                        _selectedTrackIndex = trackIdx;
-                        _selectedEntryIndex = entryIdx;
-                        ShowEntryContextMenu(trackIdx, entryIdx);
-                        e.Use();
+                        entriesProp.DeleteArrayElementAtIndex(ei);
+                        changed = true;
+                        AdjustSelectionAfterEntryDeletion(ti, ei);
                     }
-                    break;
-                case EventType.MouseDrag:
-                    if (GUIUtility.hotControl == id && _dragTrackIndex == trackIdx && _dragEntryIndex == entryIdx)
-                    {
-                        float t = MouseToTime(e.mousePosition.x, rowRect, timelineDuration);
-                        t = ApplySnap(t, timelineDuration, rowRect);
-                        switch (_dragKind)
-                        {
-                            case TimelineDragKind.EntryMove:
-                                anchorProp.floatValue = Mathf.Max(0f, t - _dragGrabOffset);
-                                ApplyTimingChanges();
-                                break;
-                            case TimelineDragKind.EntryResizeStart:
-                                {
-                                    float oldEnd = slot.EndTime;
-                                    float newStart = Mathf.Clamp(t, 0f, oldEnd);
-                                    anchorProp.floatValue = newStart;
-                                    durProp.floatValue = Mathf.Max(0f, oldEnd - newStart);
-                                    ApplyTimingChanges();
-                                    break;
-                                }
-                            case TimelineDragKind.EntryResizeEnd:
-                                {
-                                    float durationStart = mode == TimeSlotMode.Absolute ? anchorProp.floatValue : slot.StartTime;
-                                    durProp.floatValue = Mathf.Max(0f, t - durationStart);
-                                    ApplyTimingChanges();
-                                    break;
-                                }
-                        }
-                        e.Use();
-                    }
-                    break;
-                case EventType.MouseUp:
-                    if (GUIUtility.hotControl == id)
-                    {
-                        GUIUtility.hotControl = 0;
-                        _dragKind = TimelineDragKind.None;
-                        _dragTrackIndex = -1;
-                        _dragEntryIndex = -1;
-                        Repaint();
-                        e.Use();
-                    }
-                    break;
+                }
+            }
+
+            for (int ti = _tracksProp.arraySize - 1; ti >= 0; ti--)
+            {
+                var entriesProp = GetEntriesProp(ti);
+                if (entriesProp != null && entriesProp.arraySize == 0)
+                {
+                    _tracksProp.DeleteArrayElementAtIndex(ti);
+                    changed = true;
+                    AdjustSelectionAfterTrackDeletion(ti);
+                }
+            }
+
+            if (changed)
+            {
+                serializedObject.ApplyModifiedProperties();
+                ((TweenSequence)target).MarkBidingsDirty();
+                ((TweenSequence)target).MarkTimingDirty();
+                if (_previewing) SamplePreview();
             }
         }
 
         private void ApplyTimingChanges()
         {
             serializedObject.ApplyModifiedProperties();
-            ((TweenSequence)target).InvalidateTimeSlots();
+            ((TweenSequence)target).MarkTimingDirty();
             if (_previewing) SamplePreview();
             Repaint();
         }
@@ -671,11 +711,11 @@ namespace TimboJimboEditor
             var menu = new GenericMenu();
             int ct = trackIdx;
             int ce = entryIdx;
-            menu.AddItem(new GUIContent("Move Anchor To Playhead"), false, () =>
+            menu.AddItem(new GUIContent("Move Start To Playhead"), false, () =>
             {
                 var ep = GetEntriesProp(ct)?.GetArrayElementAtIndex(ce);
                 if (ep == null) return;
-                ep.FindPropertyRelative(nameof(AnimatedValueTrackEntry.AnchorTime)).floatValue = _playheadTime;
+                ep.FindPropertyRelative(nameof(AnimatedValueTrackEntry.StartTime)).floatValue = _playheadTime;
                 ApplyTimingChanges();
             });
             menu.AddItem(new GUIContent("Delete"), false, () =>
@@ -684,9 +724,8 @@ namespace TimboJimboEditor
                 if (ep == null) return;
                 ep.DeleteArrayElementAtIndex(ce);
                 serializedObject.ApplyModifiedProperties();
-                _selectedTrackIndex = -1;
-                _selectedEntryIndex = -1;
-                ((TweenSequence)target).InvalidateTimeSlots();
+                AdjustSelectionAfterEntryDeletion(ct, ce);
+                ((TweenSequence)target).MarkTimingDirty();
                 if (_previewing) SamplePreview();
             });
             menu.ShowAsContext();
@@ -715,9 +754,9 @@ namespace TimboJimboEditor
                 if (GUILayout.Button("Add Entry", GUILayout.Height(20)))
                 {
                     int created = CreateEntryAt(entriesProp, _playheadTime);
-                    _selectedEntryIndex = created;
+                    SelectEntry(_selectedTrackIndex, created);
                     serializedObject.ApplyModifiedProperties();
-                    ((TweenSequence)target).InvalidateTimeSlots();
+                    ((TweenSequence)target).MarkTimingDirty();
                     if (_previewing) SamplePreview();
                     return;
                 }
@@ -727,9 +766,9 @@ namespace TimboJimboEditor
                     if (GUILayout.Button("Delete Entry", GUILayout.Height(20)))
                     {
                         entriesProp.DeleteArrayElementAtIndex(_selectedEntryIndex);
-                        _selectedEntryIndex = -1;
+                        AdjustSelectionAfterEntryDeletion(_selectedTrackIndex, _selectedEntryIndex);
                         serializedObject.ApplyModifiedProperties();
-                        ((TweenSequence)target).InvalidateTimeSlots();
+                        ((TweenSequence)target).MarkTimingDirty();
                         if (_previewing) SamplePreview();
                         return;
                     }
@@ -743,23 +782,15 @@ namespace TimboJimboEditor
             }
 
             var entryProp = entriesProp.GetArrayElementAtIndex(_selectedEntryIndex);
-            var modeProp = entryProp.FindPropertyRelative(nameof(AnimatedValueTrackEntry.TimeSlotMode));
-            var anchorProp = entryProp.FindPropertyRelative(nameof(AnimatedValueTrackEntry.AnchorTime));
+            var startTimeProp = entryProp.FindPropertyRelative(nameof(AnimatedValueTrackEntry.StartTime));
             var durProp = entryProp.FindPropertyRelative(nameof(AnimatedValueTrackEntry.Duration));
             var animatorProp = entryProp.FindPropertyRelative(nameof(AnimatedValueTrackEntry.Animator));
             var animator = animatorProp.managedReferenceValue as ValueAnimator;
 
             EditorGUI.BeginChangeCheck();
 
-            EditorGUILayout.PropertyField(modeProp, new GUIContent("Mode"));
-            EditorGUILayout.PropertyField(anchorProp, new GUIContent("Anchor"));
-
-            if ((TimeSlotMode)modeProp.enumValueIndex != TimeSlotMode.FillGap)
-                EditorGUILayout.PropertyField(durProp, new GUIContent("Duration"));
-            else
-                EditorGUILayout.LabelField("Duration", "ignored by Fill Gap", EditorStyles.miniLabel);
-
-            DrawResolvedSlotLabel(_selectedTrackIndex, _selectedEntryIndex);
+            EditorGUILayout.PropertyField(startTimeProp, new GUIContent("Start"));
+            EditorGUILayout.PropertyField(durProp, new GUIContent("Duration"));
 
             DrawAnimatorTypeRow(animatorProp);
             DrawAnimatorParams(animatorProp, animator);
@@ -868,8 +899,7 @@ namespace TimboJimboEditor
             entriesProp.InsertArrayElementAtIndex(newIdx);
             var entry = entriesProp.GetArrayElementAtIndex(newIdx);
 
-            entry.FindPropertyRelative(nameof(AnimatedValueTrackEntry.TimeSlotMode)).enumValueIndex = (int)TimeSlotMode.Absolute;
-            entry.FindPropertyRelative(nameof(AnimatedValueTrackEntry.AnchorTime)).floatValue = Mathf.Max(0f, time);
+            entry.FindPropertyRelative(nameof(AnimatedValueTrackEntry.StartTime)).floatValue = Mathf.Max(0f, time);
             entry.FindPropertyRelative(nameof(AnimatedValueTrackEntry.Duration)).floatValue = 1f;
 
             var animatorProp = entry.FindPropertyRelative(nameof(AnimatedValueTrackEntry.Animator));
@@ -924,8 +954,8 @@ namespace TimboJimboEditor
                 {
                     SetBindableProperty(bindablePropertyProp, candidate);
                     serializedObject.ApplyModifiedProperties();
-                    sequence.InvalidateBindings();
-                    sequence.InvalidateTimeSlots();
+                    sequence.MarkBidingsDirty();
+                    sequence.MarkTimingDirty();
                     if (_previewing)
                         SamplePreview();
                     Repaint();
@@ -1065,32 +1095,6 @@ namespace TimboJimboEditor
                 .stringValue;
         }
 
-        private void DrawResolvedSlotLabel(int trackIndex, int entryIndex)
-        {
-            if (TryGetEntrySlot(trackIndex, entryIndex, out var slot))
-                EditorGUILayout.LabelField($"Resolved: {slot.StartTime:0.###}s → {slot.EndTime:0.###}s", EditorStyles.miniLabel);
-        }
-
-        private bool TryGetEntrySlot(int trackIndex, int entryIndex, out TrackTimeSlot slot)
-        {
-            var entry = GetRuntimeEntry(trackIndex, entryIndex);
-            var seq = (TweenSequence)target;
-            return seq.TryGetTimeSlot(entry, out slot);
-        }
-
-        private AnimatedValueTrackEntry GetRuntimeEntry(int trackIndex, int entryIndex)
-        {
-            var seq = (TweenSequence)target;
-            if (trackIndex < 0 || trackIndex >= seq.Tracks.Count)
-                return null;
-
-            var track = seq.Tracks[trackIndex];
-            if (track == null || entryIndex < 0 || entryIndex >= track.Entries.Count)
-                return null;
-
-            return track.Entries[entryIndex];
-        }
-
         private static bool TryGetValidProperty(AnimatedValueTrack track, out BindableProperty property)
         {
             property = default;
@@ -1101,13 +1105,11 @@ namespace TimboJimboEditor
             return property.Target != null && !string.IsNullOrEmpty(property.Path);
         }
 
-        private static Color GetEntryColor(TimeSlotMode mode, bool isSelected, bool isDragging)
+        private static Color GetEntryColor(bool isSelected, bool isDragging)
         {
             if (isDragging) return new Color(0.45f, 0.65f, 1f, 0.9f);
             if (isSelected) return new Color(0.55f, 0.75f, 1f, 0.85f);
-            return mode == TimeSlotMode.FillGap
-                ? new Color(0.35f, 0.72f, 0.55f, 0.85f)
-                : new Color(0.35f, 0.55f, 0.85f, 0.85f);
+            return new Color(0.35f, 0.55f, 0.85f, 0.85f);
         }
 
         private static void DrawOutline(Rect rect, Color color)
@@ -1116,25 +1118,6 @@ namespace TimboJimboEditor
             EditorGUI.DrawRect(new Rect(rect.x - 1f, rect.yMax, rect.width + 2f, 1f), color);
             EditorGUI.DrawRect(new Rect(rect.x - 1f, rect.y - 1f, 1f, rect.height + 2f), color);
             EditorGUI.DrawRect(new Rect(rect.xMax, rect.y - 1f, 1f, rect.height + 2f), color);
-        }
-
-        private static void DrawDiamond(Vector2 center, float radius, Color color)
-        {
-            Handles.BeginGUI();
-            Handles.color = color;
-            Handles.DrawAAConvexPolygon(
-                new Vector3(center.x, center.y - radius),
-                new Vector3(center.x + radius, center.y),
-                new Vector3(center.x, center.y + radius),
-                new Vector3(center.x - radius, center.y));
-            Handles.color = Color.black;
-            Handles.DrawAAPolyLine(1.5f,
-                new Vector3(center.x, center.y - radius),
-                new Vector3(center.x + radius, center.y),
-                new Vector3(center.x, center.y + radius),
-                new Vector3(center.x - radius, center.y),
-                new Vector3(center.x, center.y - radius));
-            Handles.EndGUI();
         }
 
         private static string GetAnimatorShortName(SerializedProperty animProp)
@@ -1172,68 +1155,232 @@ namespace TimboJimboEditor
             }
         }
 
-        private void HandleRulerInteraction(Rect ruler, float duration)
+        private void HandleTimelineInteraction(Rect ruler, Rect content, float duration)
         {
-            int id = GUIUtility.GetControlID(FocusType.Passive);
+            int id = GUIUtility.GetControlID(TimelineControlId, FocusType.Passive);
             var e = Event.current;
 
             switch (e.GetTypeForControl(id))
             {
                 case EventType.MouseDown:
-                    if (e.button == 0 && ruler.Contains(e.mousePosition))
+                    if (e.button != 0)
+                        break;
+
+                    if (TryGetTopmostEntryHit(e.mousePosition, out var hit))
                     {
+                        BeginEntryDrag(id, hit, e.mousePosition, duration);
+                        e.Use();
+                        break;
+                    }
+
+                    // if (ruler.Contains(e.mousePosition))
+                    if (ruler.Contains(e.mousePosition) || content.Contains(e.mousePosition))
+                    {
+                        BeginPlayheadDrag(id, content, duration, e.mousePosition);
+                        e.Use();
+                        break;
+                    }
+
+                    //still just capture control:
+                    {
+                        ClearSelectedEntry();
                         GUIUtility.hotControl = id;
-                        _dragKind = TimelineDragKind.Playhead;
-                        SetPlayhead(MouseToTime(e.mousePosition.x, ruler, duration), true);
                         e.Use();
                     }
                     break;
+
                 case EventType.MouseDrag:
-                    if (GUIUtility.hotControl == id && _dragKind == TimelineDragKind.Playhead)
+                    if (GUIUtility.hotControl != id)
+                        break;
+
+                    if (_dragKind == TimelineDragKind.Playhead)
                     {
-                        SetPlayhead(MouseToTime(e.mousePosition.x, ruler, duration), true);
+                        SetPlayhead(MouseToTime(e.mousePosition.x, content, duration), true);
+                        e.Use();
+                    }
+                    else if (_dragKind != TimelineDragKind.None && _dragTrackIndex >= 0 && _dragEntryIndex >= 0)
+                    {
+                        UpdateEntryDrag(e.mousePosition, duration);
                         e.Use();
                     }
                     break;
+
                 case EventType.MouseUp:
-                    if (GUIUtility.hotControl == id)
+                    if (GUIUtility.hotControl != id)
+                        break;
+
+                    if (_dragKind == TimelineDragKind.Playhead)
                     {
-                        GUIUtility.hotControl = 0;
-                        _dragKind = TimelineDragKind.None;
+                        EndTimelineDrag();
                         e.Use();
+                        break;
                     }
+
+                    DeleteZeroDurationAndEmptyTracks();
+                    EndTimelineDrag();
+                    e.Use();
+                    GUIUtility.ExitGUI();
                     break;
             }
         }
 
-        private void HandleTimelineBackgroundInteraction(Rect timeRect, float duration)
+        private bool TryGetTopmostEntryHit(Vector2 mousePosition, out EntryHit hit)
         {
-            int id = GUIUtility.GetControlID(FocusType.Passive);
-            var e = Event.current;
-
-            if (e.GetTypeForControl(id) == EventType.MouseDown && e.button == 0 && timeRect.Contains(e.mousePosition))
+            for (int i = _entryHits.Count - 1; i >= 0; i--)
             {
-                if (_dragTrackIndex < 0)
+                if (_entryHits[i].Bar.Contains(mousePosition))
                 {
-                    GUIUtility.hotControl = id;
-                    _dragKind = TimelineDragKind.Playhead;
-                    _selectedTrackIndex = -1;
-                    _selectedEntryIndex = -1;
-                    SetPlayhead(MouseToTime(e.mousePosition.x, timeRect, duration), true);
-                    e.Use();
+                    hit = _entryHits[i];
+                    return true;
                 }
             }
-            else if (e.GetTypeForControl(id) == EventType.MouseDrag && GUIUtility.hotControl == id && _dragKind == TimelineDragKind.Playhead)
+
+            hit = default;
+            return false;
+        }
+
+        private void BeginEntryDrag(int id, EntryHit hit, Vector2 mousePosition, float duration)
+        {
+            SelectEntry(hit.TrackIndex, hit.EntryIndex);
+
+            GUIUtility.hotControl = id;
+            _dragKind = hit.RightEdge.Contains(mousePosition)
+                ? TimelineDragKind.EntryResizeEnd
+                : hit.LeftEdge.Contains(mousePosition)
+                    ? TimelineDragKind.EntryResizeStart
+                    : TimelineDragKind.EntryMove;
+
+            _dragTrackIndex = hit.TrackIndex;
+            _dragEntryIndex = hit.EntryIndex;
+            _dragRowRect = hit.RowRect;
+
+            if (TryGetEntryTimingProperties(hit.TrackIndex, hit.EntryIndex, out var startTimeProp, out var durProp))
             {
-                SetPlayhead(MouseToTime(e.mousePosition.x, timeRect, duration), true);
-                e.Use();
+                _dragOriginalStart = startTimeProp.floatValue;
+                _dragOriginalDuration = durProp.floatValue;
+                _dragGhostStart = _dragOriginalStart;
+                _dragGhostEnd = _dragOriginalStart + _dragOriginalDuration;
+                _dragGrabOffset = MouseToTime(mousePosition.x, hit.RowRect, duration) - _dragOriginalStart;
             }
-            else if (e.GetTypeForControl(id) == EventType.MouseUp && GUIUtility.hotControl == id)
+            else
             {
-                GUIUtility.hotControl = 0;
-                _dragKind = TimelineDragKind.None;
-                e.Use();
+                EndTimelineDrag();
             }
+        }
+
+        private void BeginPlayheadDrag(int id, Rect content, float duration, Vector2 mousePosition)
+        {
+            ClearSelectedEntry();
+
+            GUIUtility.hotControl = id;
+            _dragKind = TimelineDragKind.Playhead;
+            _dragTrackIndex = -1;
+            _dragEntryIndex = -1;
+            _dragRowRect = default;
+            SetPlayhead(MouseToTime(mousePosition.x, content, duration), true);
+        }
+
+        private void UpdateEntryDrag(Vector2 mousePosition, float duration)
+        {
+            if (!TryGetEntryTimingProperties(_dragTrackIndex, _dragEntryIndex, out var startTimeProp, out var durProp))
+                return;
+
+            float mouseTime = MouseToTime(mousePosition.x, _dragRowRect, duration);
+            float snappedTime = ApplySnap(mouseTime, duration, _dragRowRect);
+
+            switch (_dragKind)
+            {
+                case TimelineDragKind.EntryMove:
+                {
+                    float naturalStart = Mathf.Max(0f, snappedTime - _dragGrabOffset);
+                    float naturalEnd = naturalStart + _dragOriginalDuration;
+                    GetNeighborBounds(_dragTrackIndex, _dragEntryIndex, naturalStart, naturalEnd, out float leftBound, out float rightBound);
+                    float effectiveStart = Mathf.Max(naturalStart, leftBound);
+                    float effectiveEnd = Mathf.Min(naturalEnd, rightBound);
+                    startTimeProp.floatValue = effectiveStart;
+                    durProp.floatValue = Mathf.Max(0f, effectiveEnd - effectiveStart);
+                    _dragGhostStart = naturalStart;
+                    _dragGhostEnd = naturalEnd;
+                    break;
+                }
+                case TimelineDragKind.EntryResizeStart:
+                {
+                    float pinnedEnd = _dragOriginalStart + _dragOriginalDuration;
+                    GetNeighborBounds(_dragTrackIndex, _dragEntryIndex, snappedTime, pinnedEnd, out float leftBound, out _);
+                    float newStart = Mathf.Clamp(snappedTime, leftBound, pinnedEnd);
+                    startTimeProp.floatValue = newStart;
+                    durProp.floatValue = Mathf.Max(0f, pinnedEnd - newStart);
+                    _dragGhostStart = snappedTime;
+                    _dragGhostEnd = pinnedEnd;
+                    break;
+                }
+                case TimelineDragKind.EntryResizeEnd:
+                {
+                    float currentStart = startTimeProp.floatValue;
+                    GetNeighborBounds(_dragTrackIndex, _dragEntryIndex, currentStart, snappedTime, out _, out float rightBound);
+                    float newEnd = Mathf.Clamp(snappedTime, currentStart, rightBound);
+                    durProp.floatValue = Mathf.Max(0f, newEnd - currentStart);
+                    _dragGhostStart = currentStart;
+                    _dragGhostEnd = snappedTime;
+                    break;
+                }
+            }
+
+            ApplyTimingChanges();
+        }
+
+        private bool TryGetEntryTimingProperties(int trackIdx, int entryIdx, out SerializedProperty startTimeProp, out SerializedProperty durProp)
+        {
+            startTimeProp = null;
+            durProp = null;
+
+            var entriesProp = GetEntriesProp(trackIdx);
+            if (entriesProp == null || entryIdx < 0 || entryIdx >= entriesProp.arraySize)
+                return false;
+
+            var entryProp = entriesProp.GetArrayElementAtIndex(entryIdx);
+            startTimeProp = entryProp.FindPropertyRelative(nameof(AnimatedValueTrackEntry.StartTime));
+            durProp = entryProp.FindPropertyRelative(nameof(AnimatedValueTrackEntry.Duration));
+            return startTimeProp != null && durProp != null;
+        }
+
+        private void SelectEntry(int trackIdx, int entryIdx)
+        {
+            _selectedTrackIndex = trackIdx;
+            _selectedEntryIndex = entryIdx;
+        }
+
+        private void ClearSelectedEntry()
+        {
+            _selectedTrackIndex = -1;
+            _selectedEntryIndex = -1;
+        }
+
+        private void AdjustSelectionAfterEntryDeletion(int trackIdx, int deletedEntryIdx)
+        {
+            if (_selectedTrackIndex != trackIdx)
+                return;
+
+            if (_selectedEntryIndex == deletedEntryIdx)
+            {
+                ClearSelectedEntry();
+                return;
+            }
+
+            if (_selectedEntryIndex > deletedEntryIdx)
+                _selectedEntryIndex--;
+        }
+
+        private void AdjustSelectionAfterTrackDeletion(int deletedTrackIdx)
+        {
+            if (_selectedTrackIndex == deletedTrackIdx)
+            {
+                ClearSelectedEntry();
+                return;
+            }
+
+            if (_selectedTrackIndex > deletedTrackIdx)
+                _selectedTrackIndex--;
         }
 
         private void CollectSnapPoints(float duration, Rect contentRect)
@@ -1248,15 +1395,15 @@ namespace TimboJimboEditor
             var de = GetEntriesProp(_dragTrackIndex)?.GetArrayElementAtIndex(_dragEntryIndex);
             if (de == null) return;
 
-            float dragAnchor = de.FindPropertyRelative(nameof(AnimatedValueTrackEntry.AnchorTime)).floatValue;
-            TryGetEntrySlot(_dragTrackIndex, _dragEntryIndex, out var dragSlot);
-            float dragEnd = dragSlot.EndTime;
+            float dragStart = de.FindPropertyRelative(nameof(AnimatedValueTrackEntry.StartTime)).floatValue;
+            float dragDur = de.FindPropertyRelative(nameof(AnimatedValueTrackEntry.Duration)).floatValue;
+            float dragEnd = dragStart + dragDur;
 
             foreach (float p in _snapPoints)
             {
                 if (_dragKind == TimelineDragKind.EntryMove)
                 {
-                    if (Mathf.Abs(dragAnchor - p) <= snapThresholdSec)
+                    if (Mathf.Abs(dragStart - p) <= snapThresholdSec)
                         _snapLines.Add((p, yMin, yMax));
                 }
                 else if (_dragKind == TimelineDragKind.EntryResizeEnd)
@@ -1307,12 +1454,8 @@ namespace TimboJimboEditor
                     var entry = track.Entries[ei];
                     if (entry == null) continue;
 
-                    points.Add(entry.AnchorTime);
-                    if (seq.TryGetTimeSlot(entry, out var slot))
-                    {
-                        points.Add(slot.StartTime);
-                        points.Add(slot.EndTime);
-                    }
+                    points.Add(entry.StartTime);
+                    points.Add(entry.StartTime + entry.Duration);
                 }
             }
         }
